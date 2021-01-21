@@ -198,7 +198,7 @@ Will be specially bound within each worker thread when they are spawned. Should 
   (with-slot-accessors (callback upon) await-condition
     (write-monitored-slots waiting-job
       (awaiting upon)
-      (status :bllocked)
+      (status :blocked)
       (body callback))
     (read-monitored-slots (status) upon 
       (ecase status

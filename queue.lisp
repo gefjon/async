@@ -11,7 +11,7 @@
    queue
    do-queue
    list-queue
-   push-back pop-front queue-make-empty))
+   push-back pop-front queue-make-empty queue-replace-contents))
 (in-package async/queue)
 
 (define-class queue
@@ -60,8 +60,10 @@ by `push-back' or to remove them with `pop-front'."
 (defun unsynchronized-push-back (new-element queue)
   (with-slot-accessors (head tail) queue
     (if tail
-        (progn (assert (null (cdr tail)))
-               (setf (cdr tail) (list new-element)))
+        (let* ((new-tail (list new-element)))
+          (assert (null (cdr tail)))
+          (setf (cdr tail) new-tail
+                tail new-tail))
         (progn (assert (null head))
                (setf head (list new-element)
                      tail head))))
