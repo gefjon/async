@@ -11,7 +11,8 @@
    job-queue job
    async await yield
    cancel-job-queue
-   wait-for))
+   wait-for job-seq
+   with-executor asynchronously))
 (in-package async/async)
 
 (defmacro async ((&optional (job-queue '*job-queue*))
@@ -66,3 +67,22 @@ May only occur within the lexical and dynamic extent of an `async' block."
     (join-thread worker))
   (values))
 
+(defmacro with-executor ((nthreads) &body body)
+  "Execute BODY in a context where `*job-queue*' is bound to an asynchronous executor with NTHREADS worker threads.
+
+The executor will be closed after the job BODY is finished, and jobs which have not been started at that time
+will be cancelled."
+  `(let* (queue)
+     (unwind-protect
+          (let* ((*job-queue* (make-instance 'job-queue
+                                             :nthreads ,nthreads)))
+            (setf queue *job-queue*)
+            ,@body)
+       (cancel-job-queue queue))))
+
+(defmacro asynchronously ((nthreads) &body body)
+  "Execute BODY as an asynchronous job as if by `async' in a new executor with NTHREADS worker threads, then return the values of BODY.
+
+This will be a horribly inefficient `progn' unless BODY spawns and awaits some other asynchronous jobs."
+  `(with-executor (,nthreads)
+     (wait-for (async () ,@body))))

@@ -5,53 +5,44 @@
 
 (def-suite async-executor)
 
-(defmacro test-with-queue ((nthreads) &body body)
-  `(let* ((async/job:*job-queue* (make-instance 'job-queue :nthreads ,nthreads)))
-     (unwind-protect (progn ,@body)
-       (cancel-job-queue async/job:*job-queue*))))
-
 (def-test one-job-one-thread (:suite async-executor)
-  (test-with-queue (1)
-      (let* (place
-             (job (async ()
-                    (setf place :success))))
-        (is (eq :success (wait-for job))
-            "Job ~a returned ~a" job (async/job::return-values job))
-        (is (eq :success place)))))
+  (is (eq :success
+          (asynchronously (1)
+            :success))))
 
 (def-test await-a-job (:suite async-executor)
-  (test-with-queue (1)
-    (let* ((status :initial)
-           (first-job (async ()
-                        (setf status
-                              (if (eq status :initial)
-                                  :second
-                                  :failure))))
-           (second-job (async ()
-                         (await first-job)
-                         (setf status
-                               (if (eq status :second)
-                                   :final
-                                   :failure)))))
-      (is (eq :final (wait-for second-job)))
-      (is (eq :final status)))))
+  (let* ((status :initial))
+    (is (eq :final
+            (asynchronously (1)
+              (await (async ()
+                       (setf status (if (eq status :initial)
+                                        :second
+                                        :failure))))
+              (setf status (if (eq status :second)
+                               :final
+                               :failure)))))
+    (is (eq status :final))))
 
 (def-test multiple-concurrent-jobs (:suite async-executor)
-  (test-with-queue (2)
-    (let* ((job1 (async ()
-                   (sleep 1)
-                   1))
-           (job2 (async ()
-                   (+ 1 (await job1))))
-           (job3 (async ()
-                   (* 6 (await job2))))
-           (joba (async ()
-                   (sleep 1)
-                   3))
-           (jobb (async ()
-                   (* 5 (await joba))))
-           (final-job (async ()
-                        (+ (await job3) (await jobb)))))
-      (is (= 27 (wait-for final-job))))))
+  (is (= 27
+         (asynchronously (2)
+           (let* ((one (async ()
+                          (sleep 1)
+                          1))
+                  (two (async ()
+                         (+ 1 (await one))))
+                  (twelve (async ()
+                            (* 6 (await two))))
+                  (three (async ()
+                          (sleep 1)
+                          3))
+                  (fifteen (async ()
+                             (* 5 (await three)))))
+             (+ (await twelve) (await fifteen)))))))
 
-;; TODO: write more tests lmao
+(def-test job-seq-syntax (:suite async-executor)
+  (is (= 3 (with-executor (1)
+             (wait-for (job-seq (async () 1)
+                                (lambda (one) (+ one 1))
+                                (lambda (two) (* two two))
+                                (lambda (four) (- four 1))))))))

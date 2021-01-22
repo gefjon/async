@@ -20,7 +20,7 @@
    await-condition yield-condition
    job-queue-exit
 
-   add-job wait-for))
+   add-job wait-for job-seq))
 (in-package async/job)
 
 ;;; classes
@@ -249,3 +249,18 @@ Should not be called within an `async' block - intended for non-worker threads w
 wait for their completion."
   (monitor-wait-until job (unsynchronized-job-done-p job)
     (values-list (return-values job))))
+
+(typedec #'job-seq (func (job &rest function) job))
+(defun job-seq (first-job &rest then-functions)
+  "For each of the THEN-FUNCTIONS, create a new `job' in the same executor as FIRST-JOB which awaits its predecessor and takes its return values as arguments.
+
+Analogous to a chain of `Promise.then's in Javascript (only without the error-handling support)."
+  (iter (declare (declare-variables))
+    (with job = first-job)
+    (with executor = (executor job))
+    (for function in then-functions)
+    (setf job (make-instance 'job
+                             :executor executor
+                             :awaiting job
+                             :body function))
+    (finally (return job))))
