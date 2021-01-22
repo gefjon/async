@@ -6,6 +6,8 @@
                 with-slot-accessors)
   (:import-from async/monitor
                 monitor with-monitor read-monitored-slots write-monitored-slots monitor-wait-until)
+  (:import-from alexandria
+                when-let)
   (:import-from async/queue
                 queue push-back pop-front)
   (:import-from bordeaux-threads
@@ -34,7 +36,8 @@
   :documentation "A queue of `job's associated with a set of worker threads.")
 
 (define-class job
-    ((status (member :running :not-registered :blocked :sleeping :done)
+    ((executor job-queue)
+     (status (member :running :not-registered :blocked :sleeping :done)
              :initform :not-registered
              :initarg nil)
      (return-values list
@@ -52,7 +55,6 @@ queue.")
 Maintained so that we can re-ready and enqueue those jobs when this job finishes.")
      (awaiting (or null job)
                :initform nil
-               :initarg nil
                :documentation "A job upon which this job is waiting, or nil if this job is ready to proceed.")
      (body function
            :documentation "A function which when run will carry out this job.
@@ -115,6 +117,13 @@ Will be specially bound within each worker thread when they are spawned. Should 
                   &aux (jobs (jobs job-queue)))
   "Return the next `job' from JOB-QUEUE, blocking if none are available yet."
   (pop-front jobs))
+
+(defmethod initialize-instance :after ((job job) &key &allow-other-keys)
+  (when-let ((job-to-await (awaiting job)))
+    (with-monitor job-to-await
+      (unsynchronized-job-make-awaiting job job-to-await)))
+  (unless (eq (status job) :blocked)
+    (add-job job (executor job))))
 
 ;;; job queue construction and worker threads
 
@@ -193,27 +202,29 @@ Will be specially bound within each worker thread when they are spawned. Should 
     ;; of our control-flow-related conditions?
     ))
 
+(typedec #'unsynchronized-job-make-awaiting (func (job job) (member :sleeping :blocked)))
+(defun unsynchronized-job-make-awaiting (waiting-job job-to-await)
+  "Cause WAITING-JOB to be awaiting JOB-TO-AWAIT, returning the new status of WAITING-JOB"
+  (setf (awaiting waiting-job) job-to-await)
+  (ecase (status job-to-await)
+    ((:blocked :sleeping :running)
+     (setf (status waiting-job) :blocked)
+     (push waiting-job (awaiters job-to-await)))
+    (:done
+     (setf (status waiting-job) :sleeping))
+    (:not-registered (error "attempt to wait on unregistered job")))
+  (status waiting-job))
+
 (typedec #'job-await (func (job await-condition) void))
 (defun job-await (waiting-job await-condition)
   (with-slot-accessors (callback upon) await-condition
-    (write-monitored-slots waiting-job
-      (awaiting upon)
-      (status :blocked)
-      (body callback))
-    (read-monitored-slots (status) upon 
-      (ecase status
-        ((:blocked :sleeping :running)
-         (push waiting-job (awaiters upon)))
-        (:not-registered (error "attempt to wait on unregistered job"))
-        (:done
-         ;; if WAITING-JOB attempted to `await' an already-finished job, run it immediately.
-         ;;
-         ;; TODO: consider handling this case in the `await' macro to avoid spurious non-local control flow
-         ;; and synchronization. That check would be in addition to this branch, but this branch should remain
-         ;; here - there would be an edge case where UPON finishes between the `await' check and this check.
-         (write-monitored-slots waiting-job
-           (status :sleeping))
-         (run-job waiting-job)))))
+    (when (eq :sleeping
+            ;; lock UPON first to avoid deadlock with `job-done', which will lock UPON then WAITING-JOB
+            (with-monitor upon
+              (with-monitor waiting-job
+                (setf (body waiting-job) callback)
+                (unsynchronized-job-make-awaiting waiting-job upon))))
+        (run-job waiting-job)))
   (values))
 
 (typedec #'job-yield (func (job yield-condition) void))
