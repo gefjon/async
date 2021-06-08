@@ -1,18 +1,18 @@
-(uiop:define-package async/monitor
-  (:mix cl iterate)
-  (:import-from bordeaux-threads
-                lock make-lock with-lock-held
-                make-condition-variable condition-wait condition-notify)
-  (:import-from alexandria
-                once-only with-gensyms)
-  (:import-from gefjon-utils
-                define-class
-                with-slot-accessors)
+(uiop:define-package :async/monitor
+  (:mix :cl :iterate)
+  (:import-from :bordeaux-threads
+                #:lock #:make-lock #:with-lock-held
+                #:make-condition-variable #:condition-wait #:condition-notify)
+  (:import-from :alexandria
+                #:once-only #:with-gensyms)
+  (:import-from :gefjon-utils
+                #:define-class
+                #:with-slot-accessors)
   (:export
-   monitor name
-   with-monitor monitor-wait-until
-   read-monitored-slots write-monitored-slots))
-(in-package async/monitor)
+   #:monitor #:name
+   #:with-monitor #:monitor-wait-until
+   #:read-monitored-slots #:write-monitored-slots))
+(in-package :async/monitor)
 
 (define-class monitor
     ((lock lock
