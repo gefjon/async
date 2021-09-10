@@ -1,7 +1,7 @@
-(uiop:define-package async/test
-  (:mix async/async fiveam cl)
-  (:export async-executor))
-(in-package async/test)
+(uiop:define-package :async/test
+  (:mix :async/async :fiveam :cl)
+  (:export #:async-executor))
+(in-package :async/test)
 
 (def-suite async-executor)
 

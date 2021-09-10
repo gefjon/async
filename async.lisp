@@ -1,19 +1,19 @@
-(uiop:define-package async/async
-  (:nicknames async)
-  (:mix async/monitor async/queue async/job cl)
-  (:import-from bordeaux-threads
-                join-thread)
-  (:import-from gefjon-utils
-                typedec func void)
-  (:import-from cl-cont
-                with-call/cc let/cc)
+(uiop:define-package :async/async
+  (:nicknames :async)
+  (:mix :async/monitor :async/queue :async/job :cl)
+  (:import-from :bordeaux-threads
+                #:join-thread)
+  (:import-from :gefjon-utils
+                #:typedec #:func #:void)
+  (:import-from :cl-cont
+                #:with-call/cc #:let/cc)
   (:export
-   job-queue job
-   async await yield
-   cancel-job-queue
-   wait-for job-seq
-   with-executor asynchronously))
-(in-package async/async)
+   #:job-queue #:job
+   #:async #:await #:yield
+   #:cancel-job-queue
+   #:wait-for #:job-seq
+   #:with-executor #:asynchronously))
+(in-package :async/async)
 
 (defmacro async ((&optional (job-queue '*job-queue*))
                  &body body)

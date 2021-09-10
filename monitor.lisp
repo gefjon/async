@@ -1,18 +1,18 @@
-(uiop:define-package async/monitor
-  (:mix cl iterate)
-  (:import-from bordeaux-threads
-                lock make-lock with-lock-held
-                make-condition-variable condition-wait condition-notify)
-  (:import-from alexandria
-                once-only with-gensyms)
-  (:import-from gefjon-utils
-                define-class
-                with-slot-accessors)
+(uiop:define-package :async/monitor
+  (:mix :cl :iterate)
+  (:import-from :bordeaux-threads
+                #:lock #:make-lock #:with-lock-held
+                #:make-condition-variable #:condition-wait #:condition-notify)
+  (:import-from :alexandria
+                #:once-only #:with-gensyms)
+  (:import-from :gefjon-utils
+                #:define-class
+                #:with-slot-accessors)
   (:export
-   monitor name
-   with-monitor monitor-wait-until
-   read-monitored-slots write-monitored-slots))
-(in-package async/monitor)
+   #:monitor #:name
+   #:with-monitor #:monitor-wait-until
+   #:read-monitored-slots #:write-monitored-slots))
+(in-package :async/monitor)
 
 (define-class monitor
     ((lock lock
@@ -38,14 +38,13 @@ Accesses to a monitor object O should be wrapped in (`with-monitor' O `&body' BO
 
 MONITOR must be a CLOS object which mixes in `monitor'."
   (once-only (monitor)
-    (with-gensyms (return-values)
-      `(progn
-         (assert (typep ,monitor 'monitor) ()
-                 "Attempt to `with-monitor' on non-monitor object ~a" ,monitor)
-         (with-lock-held ((lock ,monitor))
-           (let* ((,return-values (multiple-value-list (progn ,@body))))
-             (condition-notify (cond-var ,monitor))
-             (values-list ,return-values)))))))
+    `(progn
+       (assert (typep ,monitor 'monitor) ()
+               "Attempt to `with-monitor' on non-monitor object ~a" ,monitor)
+       (values-list
+        (with-lock-held ((lock ,monitor))
+          (prog1 (multiple-value-list (progn ,@body))
+            (condition-notify (cond-var ,monitor))))))))
 
 (defmacro monitor-wait-until (monitor condition &body body)
   (once-only (monitor)
