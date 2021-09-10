@@ -93,6 +93,6 @@ by `push-back' or to remove them with `pop-front'."
 If a value was removed, returns it as a primary value and T as a secondary value.
 
 If QUEUE was empty, returns (`values' nil nil)."
-  (the (values t &optional)
-       (monitor-wait-until queue (not (unsynchronized-queue-empty-p queue))
-         (unsynchronized-pop-front queue))))
+  (values
+   (monitor-wait-until queue (not (unsynchronized-queue-empty-p queue))
+     (unsynchronized-pop-front queue))))
