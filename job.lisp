@@ -9,7 +9,7 @@
   (:import-from :alexandria
                 #:when-let #:with-gensyms #:once-only)
   (:import-from :sb-thread
-                #:thread #:make-thread #:join-thread #:thread-yield)
+                #:thread #:make-thread #:join-thread #:thread-yield #:barrier)
   (:import-from :sb-ext
                 #:atomic-push #:compare-and-swap)
   (:export
@@ -25,15 +25,10 @@
 (in-package :async/job)
 
 ;;;; Invariants required by this file:
-;; - Once a job's status is set to :DONE, it will never be changed except to :INCONSISTENT, and its
-;;   JOB-RETURN-VALUES will never be altered. That is, observing a JOB-STATUS of :DONE means it is safe to
-;;   read JOB-RETURN-VALUES without synchronization.
+;; - Once a job's status is set to :DONE, it will never be changed, and its JOB-RETURN-VALUES will never be
+;;   altered. That is, observing a JOB-STATUS of :DONE means it is safe to read JOB-RETURN-VALUES without
+;;   synchronization.
 ;; - Jobs don't ever move between executors. A job can never await a job from a different executor.
-;; - The :INCONSISTENT state is used as a sort of spinlock while making destructive modifications to
-;;   jobs. Newly-constructed jobs are in the :INCONSISTENT state until make-job calls either add-job or
-;;   job-make-awaiting to set them to :SLEEPING or :BLOCKED respectively. job-make-awaiting sets the job it's
-;;   blocking on to :INCONSISTENT while it adds the new waiter to the JOB-AWAITERS list. Jobs will be made
-;;   :INCONSISTENT upon signaling a WAIT-CONDITION.
 
 ;; cas wrappers
 
@@ -67,7 +62,7 @@
 (defstruct (job (:constructor %make-job (executor body)))
   "An asynchronous task to be executed by a worker thread in a `job-queue'."
   (executor (error) :type job-queue :read-only t)
-  (status :inconsistent :type (member :inconsistent :running :blocked :sleeping :done))
+  (status :uninit :type (member :uninit :running :blocked :sleeping :done))
 
   ;; After this job finishes, a list of its return values as by `multiple-value-list'.
   ;;
@@ -124,14 +119,10 @@ Will be specially bound within each worker thread when they are spawned. Should 
 
 (typedec #'add-job (func (job) void))
 (defun add-job (job &aux (job-queue (job-executor job)))
-  "Insert JOB into its EXECUTOR, to be run whenever a worker thread is available.
-
-JOB must be in the state :INCONSISTENT."
-  (assert (eq (job-status job) :inconsistent) ()
-          "Attept to add a job with status ~a to work queue"
-          (job-status job))
+  "Insert JOB into its EXECUTOR, to be run whenever a worker thread is available."
+  (barrier (:memory)
+    (setf (job-status job) :sleeping))
   (enqueue job (job-queue-jobs job-queue))
-  (setf (job-status job) :sleeping)
   (values))
 
 (typedec #'get-job (func (&optional job-queue) job))
@@ -157,18 +148,21 @@ JOB must be in the state :INCONSISTENT."
   "Make WAITER be awaiting AWAITING, so that it runs when AWAITING finishes and takes AWAITER's return-values as arguments.
 
 WAITER must be in the state :INCONSISTENT"
-  (let* ((status (atomic-swap (job-status awaiting) :inconsistent)))
-    (if (eq status :inconsistent)
-        (job-make-awaiting waiter awaiting)
-        (progn
-          (setf (job-awaiting waiter) awaiting)
-          (ecase status
-            ((:blocked :sleeping :running)
-             (push waiter (job-awaiters awaiting))
-             (setf (job-status waiter) :blocked))
-            ((:done)
-             (add-job waiter)))))
-    (setf (job-status awaiting) status))
+  (if (barrier (:memory)
+        (eq (job-status awaiting) :uninit))
+      ;; loop until the job is initialized
+      (job-make-awaiting waiter awaiting)
+      (progn
+        (barrier (:memory)
+          (setf (job-awaiting waiter) awaiting))
+        (atomic-push waiter (job-awaiters awaiting))
+        (ecase (barrier (:memory)
+                 (job-status awaiting))
+          ((:blocked :sleeping :running)
+           (barrier (:memory)
+             (setf (job-status waiter) :blocked)))
+          ((:done)
+           (add-job waiter)))))
   (values))
 
 (typedec #'cancel-job-queue (func (&optional job-queue) void))
@@ -213,18 +207,22 @@ WAITER must be in the state :INCONSISTENT"
 
 (typedec #'job-done (func (job &rest t) void))
 (defun job-done (finished-job &rest ret-vals)
-  (cas-loop (job-status finished-job) :running :inconsistent :allowed-other-values (:inconsistent))
-  (setf (job-return-values finished-job) ret-vals)
-  (dolist (blocked-job (job-awaiters finished-job))
-    (cas-loop (job-status blocked-job) :blocked :inconsistent :allowed-other-values (:inconsistent))
-    (assert (eq (job-awaiting blocked-job) finished-job))
-    (add-job blocked-job))
-  (setf (job-status finished-job) :done)
+  (barrier (:memory)
+    (setf (job-return-values finished-job) ret-vals))
+  (let* ((jobs-to-run (barrier (:memory)
+                        (job-awaiters finished-job))))
+    (barrier (:memory)
+      (setf (job-status finished-job) :done))
+    (dolist (blocked-job jobs-to-run)
+      (assert (eq (job-status blocked-job) :blocked))
+      (assert (eq (job-awaiting blocked-job) finished-job))
+      (add-job blocked-job)))
   (values))
 
 (typedec #'get-return-values (func (job) list))
 (defun get-return-values (job)
-  (iter (for status = (job-status job))
+  (iter (for status = (barrier (:memory)
+                        (job-status job)))
     (ecase status
       ((:inconsistent) (next-iteration))
       ((:done) (return (job-return-values job)))
@@ -243,10 +241,8 @@ WAITER must be in the state :INCONSISTENT"
 
 (typedec #'run-job (func (job) void))
 (defun run-job (job)
-  (let* ((initial-status (job-status job)))
-    (assert (member initial-status '(:sleeping :inconsistent)) ()
-            "Attempt to run job with observed status ~a" initial-status))
-  (compare-and-swap (job-status job) :sleeping :running)
+  (let* ((sleeping (compare-and-swap (job-status job) :sleeping :running)))
+    (assert (eq :sleeping sleeping)))
   (handler-case (invoke-job job)
     (:no-error (&rest stuff)
       (apply #'job-done job stuff))
@@ -260,14 +256,14 @@ WAITER must be in the state :INCONSISTENT"
 
 (typedec #'job-await (func (job await-condition) void))
 (defun job-await (waiting-job await-condition)
-  (cas-loop (job-status waiting-job) :running :inconsistent :allowed-other-values (:inconsistent))
+  (assert (eq :running (barrier (:memory) (job-status waiting-job))))
   (setf (job-body waiting-job) (callback await-condition))
   (job-make-awaiting waiting-job (upon await-condition))
   (values))
 
 (typedec #'job-yield (func (job yield-condition) void))
 (defun job-yield (job yield-condition)
-  (cas-loop (job-status job) :running :inconsistent :allowed-other-values (:inconsistent))
+  (assert (eq :running (barrier (:memory) (job-status job))))
   (setf (job-body job) (callback yield-condition))
   (add-job job))
 
@@ -275,9 +271,7 @@ WAITER must be in the state :INCONSISTENT"
 
 (typedec #'job-done-p (func (job) boolean))
 (defun job-done-p (job)
-  (iter (for status = (job-status job))
-    (until (not (eq status :inconsistent)))
-    (finally (return (eq status :done)))))
+  (eq :done (barrier (:memory) (job-status job))))
 
 (typedec #'wait-for (func (job) (values &rest t)))
 (defun wait-for (job)
