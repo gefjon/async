@@ -1,76 +1,97 @@
 (uiop:define-package :async/job
   (:mix :cl :iterate)
+  (:import-from :sb-concurrency
+                #:queue #:enqueue #:dequeue #:make-queue #:queue-empty-p)
   (:import-from :gefjon-utils
                 #:define-class #:define-special
                 #:typedec #:func #:void #:list-of
                 #:with-slot-accessors)
-  (:import-from :async/monitor
-                #:monitor #:with-monitor #:read-monitored-slots #:write-monitored-slots #:monitor-wait-until)
   (:import-from :alexandria
-                #:when-let)
-  (:import-from :async/queue
-                #:queue #:push-back #:pop-front)
-  (:import-from :bordeaux-threads
-                #:thread #:make-thread #:join-thread)
+                #:when-let #:with-gensyms #:once-only)
+  (:import-from :sb-thread
+                #:thread #:make-thread #:join-thread #:thread-yield)
+  (:import-from :sb-ext
+                #:atomic-push #:compare-and-swap)
   (:export
-   #:job-queue #:jobs #:nthreads #:workers
-   #:job
+   #:job-queue #:make-job-queue
+   #:job #:make-job
    #:*job-queue*
 
    #:await-condition #:yield-condition
-   #:job-queue-exit
+
+   #:cancel-job-queue
 
    #:add-job #:wait-for #:job-seq))
 (in-package :async/job)
 
+;;;; Invariants required by this file:
+;; - Once a job's status is set to :DONE, it will never be changed except to :INCONSISTENT, and its
+;;   JOB-RETURN-VALUES will never be altered. That is, observing a JOB-STATUS of :DONE means it is safe to
+;;   read JOB-RETURN-VALUES without synchronization.
+;; - Jobs don't ever move between executors. A job can never await a job from a different executor.
+;; - The :INCONSISTENT state is used as a sort of spinlock while making destructive modifications to
+;;   jobs. Newly-constructed jobs are in the :INCONSISTENT state until make-job calls either add-job or
+;;   job-make-awaiting to set them to :SLEEPING or :BLOCKED respectively. job-make-awaiting sets the job it's
+;;   blocking on to :INCONSISTENT while it adds the new waiter to the JOB-AWAITERS list. Jobs will be made
+;;   :INCONSISTENT upon signaling a WAIT-CONDITION.
+
+;; cas wrappers
+
+(defmacro cas-loop (place old-value new-value &key (allowed-other-values nil validatep))
+  "Make PLACE hold NEW-VALUE. Retry until a consistent state where PLACE formerly held OLD-VALUE."
+  (with-gensyms (read-value)
+    (once-only (old-value new-value)
+      `(iter (for ,read-value = (compare-and-swap ,place ,old-value ,new-value))
+         (until (eq ,old-value ,read-value))
+         ,@(when validatep
+             `((assert (member ,read-value ',allowed-other-values))))))))
+
+(defmacro atomic-swap (place new-value)
+  "Make PLACE hold NEW-VALUE, returning its old value. Retry until consistency."
+  (with-gensyms (block-name old-value read-value)
+    (once-only (new-value)
+      `(iter ,block-name
+         (for ,old-value = ,place)
+         (for ,read-value = (compare-and-swap ,place ,old-value ,new-value))
+         (until (eq ,old-value ,read-value))
+         (finally (return-from ,block-name ,old-value))))))
+
 ;;; classes
 
-(define-class job-queue
-    ((jobs queue
-           :initform (make-instance 'queue)
-           :initarg nil)
-     (workers (list-of thread)
-              :initarg nil
-              :may-init-unbound t)
-     (nthreads (and fixnum unsigned-byte (not (eql 0)))))
-  :documentation "A queue of `job's associated with a set of worker threads.")
+(defstruct (job-queue (:constructor %make-job-queue (nthreads)))
+  "A queue of `job's associated with a set of worker threads."
+  (jobs (make-queue) :type queue :read-only t)
+  (workers nil :type (list-of thread))
+  (nthreads (error) :type (and fixnum unsigned-byte (not (eql 0))) :read-only t))
 
-(define-class job
-    ((executor job-queue)
-     (status (member :running :not-registered :blocked :sleeping :done)
-             :initform :not-registered
-             :initarg nil)
-     (return-values list
-                    :may-init-unbound t
-                    :initarg nil
-                    :documentation "After this job finishes, a list of its return values as by `multiple-value-list'.
+(defstruct (job (:constructor %make-job (executor body)))
+  "An asynchronous task to be executed by a worker thread in a `job-queue'."
+  (executor (error) :type job-queue :read-only t)
+  (status :inconsistent :type (member :inconsistent :running :blocked :sleeping :done))
 
-Will be passed as arguments to jobs which are `awaiting' this job, that is, jobs in this job's `awaiters'
-queue.")
-     (awaiters (list-of job)
-               :initform nil
-               :initarg nil
-               :documentation "Backpointers to jobs which are `awaiting' this job.
+  ;; After this job finishes, a list of its return values as by `multiple-value-list'.
+  ;;
+  ;; Will be passed as arguments to jobs which are `awaiting' this job, that is, jobs in this job's `awaiters'
+  ;; queue.
+  (return-values nil :type list)
 
-Maintained so that we can re-ready and enqueue those jobs when this job finishes.")
-     (awaiting (or null job)
-               :initform nil
-               :documentation "A job upon which this job is waiting, or nil if this job is ready to proceed.")
-     (body function
-           :documentation "A function which when run will carry out this job.
+  ;; Backpointers to jobs which are `awaiting' this job.
+  ;;
+  ;; Maintained so that we can re-ready and enqueue those jobs when this job finishes.
+  (awaiters nil :type (list-of job))
+  ;; A job upon which this job is waiting, or nil if this job is ready to proceed.
+  (awaiting nil :type (or null job))
 
-If BODY returns normally, this job will be marked as `:done', and its return values stored in
-`return-values'.
-
-If BODY signals `await-condition' or `yield-condition', the job will be set in that state,
-and its BODY replaced with that condition's `callback'.
-
-If `awaiting' is set to a non-nil `job', BODY will be invoked with that job's `return-values' as arguments."))
-  :superclasses (monitor)
-  :documentation "An asynchronous task to be executed by a worker thread in a `job-queue'.
-
-This class's `monitor' instance should be held while reading or writing any of its fields, but not while
-evaluating BODY.")
+  ;; A function which when run will carry out this job.
+  ;;
+  ;; If BODY returns normally, this job will be marked as `:done', and its return values stored in
+  ;; `return-values'.
+  ;;
+  ;; If BODY signals `await-condition' or `yield-condition', the job will be set in that state,
+  ;; and its BODY replaced with that condition's `callback'.
+  ;;
+  ;; If `awaiting' is set to a non-nil `job', BODY will be invoked with that job's `return-values' as arguments.
+  (body (error) :type function))
 
 ;;; special vars
 
@@ -101,29 +122,65 @@ Will be specially bound within each worker thread when they are spawned. Should 
 
 ;;; job queue operations
 
-(typedec #'add-job (func (job &optional job-queue) void))
-(defun add-job (job &optional (job-queue *job-queue*))
-  "Insert JOB into JOB-QUEUE, to be run whenever a worker thread is available."
-  (with-monitor job
-    (ecase (status job)
-      ((:blocked :running :done) (error "Attept to add a job with status ~a to work queue" (status job)))
-      (:not-registered (setf (status job) :sleeping))
-      (:sleeping nil)))
-  (push-back job (jobs job-queue))
+(typedec #'add-job (func (job) void))
+(defun add-job (job &aux (job-queue (job-executor job)))
+  "Insert JOB into its EXECUTOR, to be run whenever a worker thread is available.
+
+JOB must be in the state :INCONSISTENT."
+  (assert (eq (job-status job) :inconsistent) ()
+          "Attept to add a job with status ~a to work queue"
+          (job-status job))
+  (enqueue job (job-queue-jobs job-queue))
+  (setf (job-status job) :sleeping)
   (values))
 
 (typedec #'get-job (func (&optional job-queue) job))
 (defun get-job (&optional (job-queue *job-queue*)
-                  &aux (jobs (jobs job-queue)))
+                &aux (jobs (job-queue-jobs job-queue)))
   "Return the next `job' from JOB-QUEUE, blocking if none are available yet."
-  (pop-front jobs))
+  (iter
+    (for (values next-job presentp) = (dequeue jobs))
+    (until presentp)
+    (thread-yield)
+    (finally (return next-job))))
 
-(defmethod initialize-instance :after ((job job) &key &allow-other-keys)
-  (when-let ((job-to-await (awaiting job)))
-    (with-monitor job-to-await
-      (unsynchronized-job-make-awaiting job job-to-await)))
-  (unless (eq (status job) :blocked)
-    (add-job job (executor job))))
+(typedec #'make-job (func (&key (:awaiting (or null job)) (:executor job-queue) (:body function)) job))
+(defun make-job (&key awaiting (executor *job-queue*) body)
+  (let* ((job (%make-job executor body)))
+    (if awaiting
+        (job-make-awaiting job awaiting)
+        (add-job job))
+    job))
+
+(typedec #'job-make-awaiting (func (job job) void))
+(defun job-make-awaiting (waiter awaiting)
+  "Make WAITER be awaiting AWAITING, so that it runs when AWAITING finishes and takes AWAITER's return-values as arguments.
+
+WAITER must be in the state :INCONSISTENT"
+  (let* ((status (atomic-swap (job-status awaiting) :inconsistent)))
+    (if (eq status :inconsistent)
+        (job-make-awaiting waiter awaiting)
+        (progn
+          (setf (job-awaiting waiter) awaiting)
+          (ecase status
+            ((:blocked :sleeping :running)
+             (push waiter (job-awaiters awaiting))
+             (setf (job-status waiter) :blocked))
+            ((:done)
+             (add-job waiter)))))
+    (setf (job-status awaiting) status))
+  (values))
+
+(typedec #'cancel-job-queue (func (&optional job-queue) void))
+(defun cancel-job-queue (&optional (job-queue *job-queue*))
+  "Cancel any jobs remaining in JOB-QUEUE and join its worker threads."
+  (iter (until (queue-empty-p (job-queue-jobs job-queue)))
+    (dequeue (job-queue-jobs job-queue)))
+  (dotimes (n (job-queue-nthreads job-queue))
+    (make-job :executor job-queue :body (lambda () (error 'job-queue-exit))))
+  (dolist (worker (job-queue-workers job-queue))
+    (join-thread worker))
+  (values))
 
 ;;; job queue construction and worker threads
 
@@ -141,56 +198,55 @@ Will be specially bound within each worker thread when they are spawned. Should 
     (make-thread #'worker-body
                  :name (symbol-name (gensym "EXECUTOR-THREAD-")))))
 
-(defmethod initialize-instance :after ((job-queue job-queue) &key &allow-other-keys)
-  "Spawn worker threads"
+(typedec #'make-job-queue (func ((and fixnum unsigned-byte (not (eql 0)))) job-queue))
+(defun make-job-queue  (nthreads &aux (job-queue (%make-job-queue nthreads)))
   (flet ((worker-body ()
            (worker-loop job-queue)))
-    (setf (workers job-queue)
-          (iter (for i below (nthreads job-queue))
+    (setf (job-queue-workers job-queue)
+          (iter (declare (declare-variables))
+            (for (the fixnum i) below nthreads)
             (collect (make-thread #'worker-body
-                                  :name (symbol-name (gensym "EXECUTOR-THREAD-"))))))))
+                                  :name (format nil "EXECUTOR-THREAD-~d" i))))))
+  job-queue)
 
 ;;; job life cycle
 
 (typedec #'job-done (func (job &rest t) void))
 (defun job-done (finished-job &rest ret-vals)
-  (with-monitor finished-job
-    ;; first, mark FINISHED-JOB as completed and record its return values
-    (setf (return-values finished-job) ret-vals
-          (status finished-job) :done)
-    ;; then, for each job in its `awaiters',
-    (dolist (blocked-job (awaiters finished-job))
-      (with-monitor blocked-job
-        (assert (eq (awaiting blocked-job) finished-job))
-        (assert (eq (status blocked-job) :blocked))
-        ;; change that job's status from `:blocked'
-        (setf (status blocked-job) :sleeping))
-      ;; and insert it into the `job-queue'.
-      (add-job blocked-job)))
+  (cas-loop (job-status finished-job) :running :inconsistent :allowed-other-values (:inconsistent))
+  (setf (job-return-values finished-job) ret-vals)
+  (dolist (blocked-job (job-awaiters finished-job))
+    (cas-loop (job-status blocked-job) :blocked :inconsistent :allowed-other-values (:inconsistent))
+    (assert (eq (job-awaiting blocked-job) finished-job))
+    (add-job blocked-job))
+  (setf (job-status finished-job) :done)
   (values))
+
+(typedec #'get-return-values (func (job) list))
+(defun get-return-values (job)
+  (iter (for status = (job-status job))
+    (ecase status
+      ((:inconsistent) (next-iteration))
+      ((:done) (return (job-return-values job)))
+      ((:sleeping :blocked :running) (error "Attempt to get return values of an unfinished job")))))
 
 (typedec #'invoke-job (func (job) (values &rest t)))
 (defun invoke-job (job)
-  (read-monitored-slots (awaiting body) job
+  (let* ((awaiting (job-awaiting job))
+         (body (job-body job)))
     (apply body
            (if awaiting
                ;; if JOB was `awaiting' another `job', invoke BODY with its `return-values'.
-               (read-monitored-slots (status return-values) awaiting
-                 (assert (eq status :done))
-                 return-values)
+               (get-return-values awaiting)
                ;; if not, invoke JOB with no arguments.
                nil))))
 
-(typedec #'make-job-running (func (job) void))
-(defun make-job-running (job)
-  "Set the `status' of JOB to `:running' in a way observable to other threads."
-  (with-monitor job
-    (assert (eq (status job) :sleeping))
-    (setf (status job) :running)))
-
 (typedec #'run-job (func (job) void))
 (defun run-job (job)
-  (make-job-running job)
+  (let* ((initial-status (job-status job)))
+    (assert (member initial-status '(:sleeping :inconsistent)) ()
+            "Attempt to run job with observed status ~a" initial-status))
+  (compare-and-swap (job-status job) :sleeping :running)
   (handler-case (invoke-job job)
     (:no-error (&rest stuff)
       (apply #'job-done job stuff))
@@ -202,44 +258,26 @@ Will be specially bound within each worker thread when they are spawned. Should 
     ;; of our control-flow-related conditions?
     ))
 
-(typedec #'unsynchronized-job-make-awaiting (func (job job) (member :sleeping :blocked)))
-(defun unsynchronized-job-make-awaiting (waiting-job job-to-await)
-  "Cause WAITING-JOB to be awaiting JOB-TO-AWAIT, returning the new status of WAITING-JOB"
-  (setf (awaiting waiting-job) job-to-await)
-  (ecase (status job-to-await)
-    ((:blocked :sleeping :running)
-     (setf (status waiting-job) :blocked)
-     (push waiting-job (awaiters job-to-await)))
-    (:done
-     (setf (status waiting-job) :sleeping))
-    (:not-registered (error "attempt to wait on unregistered job")))
-  (status waiting-job))
-
 (typedec #'job-await (func (job await-condition) void))
 (defun job-await (waiting-job await-condition)
-  (with-slot-accessors (callback upon) await-condition
-    (when (eq :sleeping
-            ;; lock UPON first to avoid deadlock with `job-done', which will lock UPON then WAITING-JOB
-            (with-monitor upon
-              (with-monitor waiting-job
-                (setf (body waiting-job) callback)
-                (unsynchronized-job-make-awaiting waiting-job upon))))
-        (run-job waiting-job)))
+  (cas-loop (job-status waiting-job) :running :inconsistent :allowed-other-values (:inconsistent))
+  (setf (job-body waiting-job) (callback await-condition))
+  (job-make-awaiting waiting-job (upon await-condition))
   (values))
 
 (typedec #'job-yield (func (job yield-condition) void))
 (defun job-yield (job yield-condition)
-  (write-monitored-slots job
-    (status :sleeping)
-    (body (callback yield-condition))
-    (awaiting nil))
+  (cas-loop (job-status job) :running :inconsistent :allowed-other-values (:inconsistent))
+  (setf (job-body job) (callback yield-condition))
   (add-job job))
 
 ;;; misc. job operations
 
-(typedec #'unsynchronized-job-done-p (func (job) boolean))
-(defun unsynchronized-job-done-p (job)
-  (eq (status job) :done))
+(typedec #'job-done-p (func (job) boolean))
+(defun job-done-p (job)
+  (iter (for status = (job-status job))
+    (until (not (eq status :inconsistent)))
+    (finally (return (eq status :done)))))
 
 (typedec #'wait-for (func (job) (values &rest t)))
 (defun wait-for (job)
@@ -247,8 +285,9 @@ Will be specially bound within each worker thread when they are spawned. Should 
 
 Should not be called within an `async' block - intended for non-worker threads which create jobs and then must
 wait for their completion."
-  (monitor-wait-until job (unsynchronized-job-done-p job)
-    (values-list (return-values job))))
+  (iter (until (job-done-p job))
+    (thread-yield)
+    (finally (return (values-list (get-return-values job))))))
 
 (typedec #'job-seq (func (job &rest function) job))
 (defun job-seq (first-job &rest then-functions)
@@ -257,10 +296,10 @@ wait for their completion."
 Analogous to a chain of `Promise.then's in Javascript (only without the error-handling support)."
   (iter (declare (declare-variables))
     (with job = first-job)
-    (with executor = (executor job))
+    (with executor = (job-executor job))
     (for function in then-functions)
-    (setf job (make-instance 'job
-                             :executor executor
-                             :awaiting job
-                             :body function))
+    (setf job (make-job
+               :executor executor
+               :awaiting job
+               :body function))
     (finally (return job))))

@@ -1,5 +1,5 @@
 (uiop:define-package :async/test
-  (:mix :async/async :fiveam :cl)
+  (:mix :async/async :fiveam :cl :iterate)
   (:export #:async-executor))
 (in-package :async/test)
 
@@ -46,3 +46,18 @@
                                 (lambda (one) (+ one 1))
                                 (lambda (two) (* two two))
                                 (lambda (four) (- four 1))))))))
+
+(def-test multiple-concurrent-jobs-many-times (:suite async-executor)
+  (with-executor (4)
+    (labels ((make-job-sums-to-2^ (n)
+               (if (= n 0)
+                   (async () 1)
+                   (let* ((left (make-job-sums-to-2^ (1- n)))
+                          (right (make-job-sums-to-2^ (1- n))))
+                     (async () (+ (await left) (await right)))))))
+      (let* ((jobs (iter outer (for i from 0 to 8)
+                     (collect (make-job-sums-to-2^ i)))))
+        (iter (for job in jobs)
+          (for i from 0 to 8)
+          (is (= (expt 2 i) (wait-for job)))
+          (finish-output *test-dribble*))))))

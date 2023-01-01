@@ -1,8 +1,6 @@
 (uiop:define-package :async/async
   (:nicknames :async)
-  (:mix :async/monitor :async/queue :async/job :cl)
-  (:import-from :bordeaux-threads
-                #:join-thread)
+  (:mix :async/job :cl)
   (:import-from :gefjon-utils
                 #:typedec #:func #:void)
   (:import-from :cl-cont
@@ -37,11 +35,10 @@ May only occur within the lexical and dynamic extent of an `async' block."
                     (error 'yield-condition
                            :callback callback))
                   (values))))
-     (make-instance 'job
-                    :executor ,job-queue
-                    :body (lambda ()
-                            (with-call/cc
-                              ,@body)))))
+     (make-job :executor ,job-queue
+               :body (lambda ()
+                       (with-call/cc
+                         ,@body)))))
 
 (defmacro await (job)
   "Block the current job on JOB, causing the current job to not be executed again until JOB finishes, and returning JOB's return values.
@@ -56,17 +53,6 @@ May only occur within the lexical and dynamic extent of an `async' block."
 May only occur within the lexical and dynamic extent of an `async' block."
   (error "`yield' may only appear inside of an `async' block"))
 
-(typedec #'job-queue-exit (func (job-queue) void))
-(defun cancel-job-queue (job-queue)
-  "Cancel any jobs remaining in JOB-QUEUE and join its worker threads."
-  (queue-make-empty (jobs job-queue))
-  (dotimes (n (nthreads job-queue))
-    (async (job-queue)
-      (error 'job-queue-exit)))
-  (dolist (worker (workers job-queue))
-    (join-thread worker))
-  (values))
-
 (defmacro with-executor ((nthreads) &body body)
   "Execute BODY in a context where `*job-queue*' is bound to an asynchronous executor with NTHREADS worker threads.
 
@@ -74,8 +60,7 @@ The executor will be closed after the job BODY is finished, and jobs which have 
 will be cancelled."
   `(let* (queue)
      (unwind-protect
-          (let* ((*job-queue* (make-instance 'job-queue
-                                             :nthreads ,nthreads)))
+          (let* ((*job-queue* (make-job-queue ,nthreads)))
             (setf queue *job-queue*)
             ,@body)
        (cancel-job-queue queue))))
