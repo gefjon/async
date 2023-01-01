@@ -6,6 +6,7 @@
   (:import-from :alexandria
                 #:once-only #:with-gensyms)
   (:import-from :gefjon-utils
+                #:typedec #:func
                 #:define-class
                 #:with-slot-accessors)
   (:export
@@ -33,30 +34,33 @@ Accesses to a monitor object O should be wrapped in (`with-monitor' O `&body' BO
   (setf (name instance)
         (gensym (format nil "~a-" (class-name (class-of instance))))))
 
-(defmacro with-monitor (monitor &body body)
+(typedec #'%with-monitor
+         (func (monitor (func () (values &rest t)) boolean) (values &rest t)))
+(defun %with-monitor (monitor thunk notifyp)
+  (with-lock-held ((lock monitor))
+    (multiple-value-prog1 (funcall thunk)
+      (when notifyp
+        (condition-notify (cond-var monitor))))))
+
+(defmacro with-monitor ((monitor &key notify) &body body)
   "Execute BODY with synchronized-safe access to MONITOR.
 
 MONITOR must be a CLOS object which mixes in `monitor'."
-  (once-only (monitor)
-    `(progn
-       (assert (typep ,monitor 'monitor) ()
-               "Attempt to `with-monitor' on non-monitor object ~a" ,monitor)
-       (values-list
-        (with-lock-held ((lock ,monitor))
-          (prog1 (multiple-value-list (progn ,@body))
-            (condition-notify (cond-var ,monitor))))))))
+  `(%with-monitor ,monitor (lambda () ,@body) (if ,notify t nil)))
+
+(typedec #'%monitor-wait-until
+         (func (monitor
+                (func () (values t &rest t))
+                (func () (values &rest t)))
+               (values &rest t)))
+(defun %monitor-wait-until (monitor predicate thunk)
+  (with-monitor monitor
+    (iter (until (funcall predicate))
+      (condition-wait (cond-var monitor) (lock monitor))
+      (finally (return (funcall thunk))))))
 
 (defmacro monitor-wait-until (monitor condition &body body)
-  (once-only (monitor)
-    (with-gensyms (return-values)
-      `(with-monitor ,monitor
-         (iter
-           (for condition-p = ,condition)
-           (until condition-p)
-           (condition-wait (cond-var ,monitor) (lock ,monitor))
-           (finally (let* ((,return-values (multiple-value-list (progn ,@body))))
-                      (condition-notify (cond-var ,monitor))
-                      (return (values-list ,return-values)))))))))
+  `(%monitor-wait-until ,monitor (lambda () ,condition) (lambda () ,@body)))
 
 (defmacro read-monitored-slots ((&rest slot-names) monitor &body body)
   "Evaluate BODY with each of the SLOT-NAMES bound to the associated accessor-value from MONITOR, but without MONITOR's lock held.
