@@ -30,27 +30,6 @@
 ;;   synchronization.
 ;; - Jobs don't ever move between executors. A job can never await a job from a different executor.
 
-;; cas wrappers
-
-(defmacro cas-loop (place old-value new-value &key (allowed-other-values nil validatep))
-  "Make PLACE hold NEW-VALUE. Retry until a consistent state where PLACE formerly held OLD-VALUE."
-  (with-gensyms (read-value)
-    (once-only (old-value new-value)
-      `(iter (for ,read-value = (compare-and-swap ,place ,old-value ,new-value))
-         (until (eq ,old-value ,read-value))
-         ,@(when validatep
-             `((assert (member ,read-value ',allowed-other-values))))))))
-
-(defmacro atomic-swap (place new-value)
-  "Make PLACE hold NEW-VALUE, returning its old value. Retry until consistency."
-  (with-gensyms (block-name old-value read-value)
-    (once-only (new-value)
-      `(iter ,block-name
-         (for ,old-value = ,place)
-         (for ,read-value = (compare-and-swap ,place ,old-value ,new-value))
-         (until (eq ,old-value ,read-value))
-         (finally (return-from ,block-name ,old-value))))))
-
 ;;; classes
 
 (defstruct (job-queue (:constructor %make-job-queue (nthreads)))
@@ -184,13 +163,6 @@ WAITER must be in the state :INCONSISTENT"
     (handler-case (iter (for job = (get-job queue))
                     (run-job job))
       (job-queue-exit () (return-from worker-loop (values))))))
-
-(typedec #'make-worker-thread (func (job-queue) thread))
-(defun make-worker-thread (job-queue)
-  (flet ((worker-body ()
-           (worker-loop job-queue)))
-    (make-thread #'worker-body
-                 :name (symbol-name (gensym "EXECUTOR-THREAD-")))))
 
 (typedec #'make-job-queue (func ((and fixnum unsigned-byte (not (eql 0)))) job-queue))
 (defun make-job-queue  (nthreads &aux (job-queue (%make-job-queue nthreads)))
