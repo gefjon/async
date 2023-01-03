@@ -9,7 +9,7 @@
   (:import-from :alexandria
                 #:when-let #:with-gensyms #:once-only)
   (:import-from :sb-thread
-                #:thread #:make-thread #:join-thread #:thread-yield #:barrier)
+                #:thread #:make-thread #:join-thread #:interrupt-thread #:thread-yield #:barrier)
   (:import-from :sb-ext
                 #:atomic-push #:compare-and-swap)
   (:export
@@ -19,7 +19,7 @@
 
    #:await-condition #:yield-condition
 
-   #:cancel-job-queue
+   #:cancel-job-queue #:kill-job-queue
 
    #:add-job #:wait-for #:job-seq))
 (in-package :async/job)
@@ -29,6 +29,27 @@
 ;;   altered. That is, observing a JOB-STATUS of :DONE means it is safe to read JOB-RETURN-VALUES without
 ;;   synchronization.
 ;; - Jobs don't ever move between executors. A job can never await a job from a different executor.
+
+;;; Atomic helpers
+
+;; If I was feeling cool, I'd write VOPs for these so that on arm64 they compiled to actual LDAR/STLR
+;; instructions (and on intel they compiled to whatever intel has instead), but for now these versions are
+;; fine.
+
+;; Note that SBCL doesn't have a concept of :ACQUIRE or :RELEASE barriers, which are weaker than :MEMORY but
+;; orthogonal to :READ or :WRITE. The short version is that an :ACQUIRE barrier signifies the start of a
+;; critical region, and a :RELEASE barrier the end, and memory options (both reads and writes) between them
+;; will stay between them, but operations from before the start or after the end may be reordered freely into
+;; the middle. Absent that capability, I'm forced to upgrade both macros to use :MEMORY. I still think they're
+;; valuable as documentation.
+
+(defmacro load-acquire (&body (expr))
+  `(barrier (:memory)
+     ,expr))
+
+(defmacro store-release (&body (expr))
+  `(barrier (:memory)
+     ,expr))
 
 ;;; classes
 
@@ -99,7 +120,7 @@ Will be specially bound within each worker thread when they are spawned. Should 
 (typedec #'add-job (func (job) void))
 (defun add-job (job &aux (job-queue (job-executor job)))
   "Insert JOB into its EXECUTOR, to be run whenever a worker thread is available."
-  (barrier (:memory)
+  (store-release
     (setf (job-status job) :sleeping))
   (enqueue job (job-queue-jobs job-queue))
   (values))
@@ -127,18 +148,18 @@ Will be specially bound within each worker thread when they are spawned. Should 
   "Make WAITER be awaiting AWAITING, so that it runs when AWAITING finishes and takes AWAITER's return-values as arguments.
 
 WAITER must be in the state :INCONSISTENT"
-  (if (barrier (:memory)
-        (eq (job-status awaiting) :uninit))
+  (if (eq :uninit
+          (load-acquire (job-status awaiting)))
       ;; loop until the job is initialized
       (job-make-awaiting waiter awaiting)
       (progn
-        (barrier (:memory)
+        (store-release
           (setf (job-awaiting waiter) awaiting))
         (atomic-push waiter (job-awaiters awaiting))
-        (ecase (barrier (:memory)
+        (ecase (load-acquire
                  (job-status awaiting))
           ((:blocked :sleeping :running)
-           (barrier (:memory)
+           (store-release
              (setf (job-status waiter) :blocked)))
           ((:done)
            (add-job waiter)))))
@@ -152,6 +173,17 @@ WAITER must be in the state :INCONSISTENT"
   (dotimes (n (job-queue-nthreads job-queue))
     (make-job :executor job-queue :body (lambda () (error 'job-queue-exit))))
   (dolist (worker (job-queue-workers job-queue))
+    (join-thread worker))
+  (values))
+
+(typedec #'kill-job-queue (func (&optional job-queue) void))
+(defun kill-job-queue (&optional (job-queue *job-queue*))
+  "Forcefully kill JOB-QUEUE, interrupting any in-flight jobs.
+
+This is super unsafe and may leave things in a bad state. It's intended as a panic button in the REPL. Please
+don't use it in real code."
+  (dolist (worker (job-queue-workers job-queue))
+    (sb-thread:interrupt-thread worker (lambda () (error 'job-queue-exit)))
     (join-thread worker))
   (values))
 
@@ -179,11 +211,28 @@ WAITER must be in the state :INCONSISTENT"
 
 (typedec #'job-done (func (job &rest t) void))
 (defun job-done (finished-job &rest ret-vals)
+  ;; important use of :MEMORY barriers: impose ordering between:
+  ;; 1. writing JOB-RETURN-VALUES
+  ;; 2. setting JOB-STATUS :DONE
+  ;; 3. processing JOB-AWAITERS
   (barrier (:memory)
     (setf (job-return-values finished-job) ret-vals))
-  (let* ((jobs-to-run (barrier (:memory)
+  ;; we really need 2CAS here.
+  ;; currently, there's a race condition. given two worker threads A and B, with jobs A' and B', imagine the sequence:
+  ;; A: A' signals (await B')
+  ;; B: B' returns
+  ;; A: (setf (awaiting A') B')
+  ;; A: (atomic-push A' (job-awaiters B'))
+  ;; B: (load-acquire (job-awaiters B'))
+  ;; B: (setf (job-status B') :done)
+  ;; A: (ecase (job-status B') (:done (add-job A')) ...) because B' was already :DONE
+  ;; B: (add-job A') while processing waiters
+  ;; oh no, A' is now in the :SLEEPING queue twice!
+  (let* ((jobs-to-run (load-acquire
                         (job-awaiters finished-job))))
     (barrier (:memory)
+      ;; mark the job done before processing its waiters, so that any jobs that finish during processing its
+      ;; waiters will see that it's done and ready themselves
       (setf (job-status finished-job) :done))
     (dolist (blocked-job jobs-to-run)
       (assert (eq (job-status blocked-job) :blocked))
@@ -193,12 +242,9 @@ WAITER must be in the state :INCONSISTENT"
 
 (typedec #'get-return-values (func (job) list))
 (defun get-return-values (job)
-  (iter (for status = (barrier (:memory)
-                        (job-status job)))
-    (ecase status
-      ((:inconsistent) (next-iteration))
-      ((:done) (return (job-return-values job)))
-      ((:sleeping :blocked :running) (error "Attempt to get return values of an unfinished job")))))
+  (ecase (load-acquire (job-status job))
+    ((:done) (job-return-values job))
+    ((:uninit :sleeping :blocked :running) (error "Attempt to get return values of an unfinished job"))))
 
 (typedec #'invoke-job (func (job) (values &rest t)))
 (defun invoke-job (job)
@@ -228,14 +274,14 @@ WAITER must be in the state :INCONSISTENT"
 
 (typedec #'job-await (func (job await-condition) void))
 (defun job-await (waiting-job await-condition)
-  (assert (eq :running (barrier (:memory) (job-status waiting-job))))
+  (assert (eq :running (load-acquire (job-status waiting-job))))
   (setf (job-body waiting-job) (callback await-condition))
   (job-make-awaiting waiting-job (upon await-condition))
   (values))
 
 (typedec #'job-yield (func (job yield-condition) void))
 (defun job-yield (job yield-condition)
-  (assert (eq :running (barrier (:memory) (job-status job))))
+  (assert (eq :running (load-acquire (job-status job))))
   (setf (job-body job) (callback yield-condition))
   (add-job job))
 
@@ -243,7 +289,7 @@ WAITER must be in the state :INCONSISTENT"
 
 (typedec #'job-done-p (func (job) boolean))
 (defun job-done-p (job)
-  (eq :done (barrier (:memory) (job-status job))))
+  (eq :done (job-status job)))
 
 (typedec #'wait-for (func (job) (values &rest t)))
 (defun wait-for (job)
